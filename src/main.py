@@ -6,6 +6,21 @@ import sqlite3
 import sys
 import textwrap
 import time
+FEED_URLS = [
+    "https://civil.ge/feed/",
+    "https://netgazeti.ge/feed/",
+    "https://www.interpressnews.ge/ge/index.php/feed/index.1.rss",
+    "https://publika.ge/feed/",
+    "https://agenda.ge/feed/",
+    "https://imedi.ge/feed/",
+    "https://imedinews.ge/feed/",
+    "https://tabula.ge/feed/",
+    "https://timer.ge/feed/",
+    "https://tvpirveli.ge/feed/",
+    "https://2020news.ge/feed/",
+    "https://metronome.ge/feed/",
+    "https://news.ge/feed/",
+]
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
