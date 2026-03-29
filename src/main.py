@@ -245,23 +245,5 @@ requests.post(url, data={
     "text": "✅ TEST MESSAGE - ბოტი მუშაობს!"
 })
 
-import requests
-import os
-import time
-
 if __name__ == "__main__":
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHANNEL_ID")
-
-    msg = f"✅ BOT TEST {int(time.time())}"
-
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={"chat_id": chat_id, "text": msg},
-        timeout=30,
-    )
-
-    print("STATUS:", response.status_code)
-    print("BODY:", response.text)
-
-    raise SystemExit(0)
+    raise SystemExit(main())
