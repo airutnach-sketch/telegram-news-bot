@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import feedparser
 import requests
@@ -23,21 +23,35 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "seen.db")
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/1.0)"
 
-FEED_URLS = [
+KEYWORDS_ENV = os.getenv("KEYWORDS", "გიორგი გახარია, გახარია, პარტია საქართველოსთვის")
+KEYWORDS = [k.strip() for k in re.split(r"[,\n;]+", KEYWORDS_ENV) if k.strip()]
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+BACKFILL_HOURS = int(os.getenv("BACKFILL_HOURS", "24"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "25"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+if not CHANNEL_ID:
+    raise RuntimeError("Missing TELEGRAM_CHANNEL_ID")
+if not KEYWORDS:
+    raise RuntimeError("Missing KEYWORDS")
+
+# Google News RSS queries ქივორდებით
+GOOGLE_NEWS_FEEDS = [
+    f"https://news.google.com/rss/search?q={quote_plus(keyword)}&hl=ka&gl=GE&ceid=GE:ka"
+    for keyword in KEYWORDS
+]
+
+# პირდაპირი feed-ები, რაც ყველაზე მეტად მუშაობს
+DIRECT_FEEDS = [
     "https://civil.ge/feed/",
     "https://netgazeti.ge/feed/",
-    "https://www.interpressnews.ge/ge/index.php/feed/index.1.rss",
     "https://publika.ge/feed/",
-    "https://agenda.ge/feed/",
-    "https://imedi.ge/feed/",
-    "https://imedinews.ge/feed/",
-    "https://tabula.ge/feed/",
-    "https://timer.ge/feed/",
-    "https://tvpirveli.ge/feed/",
-    "https://2020news.ge/feed/",
-    "https://metronome.ge/feed/",
-    "https://news.ge/feed/",
 ]
+
+FEED_URLS = GOOGLE_NEWS_FEEDS + DIRECT_FEEDS
 
 
 @dataclass
@@ -45,29 +59,11 @@ class Article:
     title: str
     link: str
     source: str
-    published: datetime
+    published_dt: datetime
+    published_text: str
     summary: str
     matched_keywords: List[str]
     uid: str
-
-
-def env(name: str, default: str | None = None, required: bool = False) -> str:
-    value = os.getenv(name, default)
-    if required and not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value or ""
-
-
-def parse_keywords(raw: str) -> List[str]:
-    parts = re.split(r"[,\n;]+", raw)
-    return [p.strip() for p in parts if p.strip()]
-
-
-BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
-CHANNEL_ID = env("TELEGRAM_CHANNEL_ID", required=True)
-KEYWORDS = parse_keywords(env("KEYWORDS", required=True))
-BACKFILL_HOURS = int(env("BACKFILL_HOURS", "24"))
-MAX_POSTS_PER_RUN = int(env("MAX_POSTS_PER_RUN", "25"))
 
 
 def init_db() -> sqlite3.Connection:
@@ -94,7 +90,7 @@ def strip_html(raw: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
-def parse_entry_datetime(entry) -> datetime | None:
+def parse_entry_datetime(entry):
     if getattr(entry, "published_parsed", None):
         try:
             return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -129,14 +125,15 @@ def is_within_last_hours(entry, hours: int) -> bool:
     return entry_dt >= cutoff
 
 
-def entry_datetime_text(dt: datetime | None) -> str:
+def format_entry_datetime(entry) -> str:
+    dt = parse_entry_datetime(entry)
     if not dt:
         return "უცნობი დრო"
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def normalize_link(link: str) -> str:
-    return link.strip()
+    return (link or "").strip()
 
 
 def make_uid(title: str, link: str) -> str:
@@ -156,15 +153,32 @@ def remember(conn: sqlite3.Connection, article: Article) -> None:
     conn.commit()
 
 
-def matched_keywords(text: str) -> List[str]:
+def matched_keywords_in_text(text: str) -> List[str]:
     lower = text.casefold()
     return [kw for kw in KEYWORDS if kw.casefold() in lower]
 
 
-def source_from_entry(feed_url: str) -> str:
+def source_from_entry(entry, feed_url: str) -> str:
+    source_title = strip_html(getattr(entry, "source", "")) if isinstance(getattr(entry, "source", None), str) else ""
+    if source_title:
+        return source_title
+
+    if getattr(entry, "source", None):
+        try:
+            nested = strip_html(getattr(entry.source, "title", "") or "")
+            if nested:
+                return nested
+        except Exception:
+            pass
+
+    feed = parse_feed(feed_url)
+    if feed and getattr(feed, "feed", None):
+        feed_title = strip_html(getattr(feed.feed, "title", "") or "")
+        if feed_title:
+            return feed_title
+
     try:
-        parsed = urlparse(feed_url)
-        return parsed.netloc.replace("www.", "")
+        return urlparse(feed_url).netloc.replace("www.", "")
     except Exception:
         return "უცნობი წყარო"
 
@@ -179,6 +193,21 @@ def parse_feed(url: str):
     except Exception as exc:
         print(f"Feed error for {url}: {exc}", file=sys.stderr)
         return None
+
+
+def extract_entry_text(entry) -> str:
+    title = strip_html(getattr(entry, "title", "") or "")
+    summary = strip_html(
+        getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+    )
+    return f"{title} {summary}".strip()
+
+
+def shorten(text: str, width: int = 280) -> str:
+    text = text.strip()
+    if not text:
+        return "მოკლე აღწერა არ არის მოცემული."
+    return textwrap.shorten(text, width=width, placeholder="...")
 
 
 def collect_articles(conn: sqlite3.Connection) -> List[Article]:
@@ -197,9 +226,9 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
             summary = strip_html(
                 getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
             )
-            text_blob = f"{title} {summary}"
+            text_blob = extract_entry_text(entry)
 
-            matches = matched_keywords(text_blob)
+            matches = matched_keywords_in_text(text_blob)
             if not matches:
                 continue
 
@@ -207,17 +236,18 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
             if not link:
                 continue
 
-            uid = make_uid(title, link)
+            uid = make_uid(title or "უსათაურო", link)
             if already_seen(conn, uid):
                 continue
 
-            published_dt = parse_entry_datetime(entry)
+            published_dt = parse_entry_datetime(entry) or datetime.now(timezone.utc)
 
             article = Article(
                 title=title or "უსათაურო მასალა",
                 link=link,
-                source=source_from_entry(feed_url),
-                published=published_dt or datetime.now(timezone.utc),
+                source=source_from_entry(entry, feed_url),
+                published_dt=published_dt,
+                published_text=format_entry_datetime(entry),
                 summary=summary,
                 matched_keywords=matches,
                 uid=uid,
@@ -225,15 +255,8 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
             items[uid] = article
 
     articles = list(items.values())
-    articles.sort(key=lambda a: a.published, reverse=True)
+    articles.sort(key=lambda a: a.published_dt, reverse=True)
     return articles[:MAX_POSTS_PER_RUN]
-
-
-def shorten(text: str, width: int = 280) -> str:
-    text = text.strip()
-    if not text:
-        return "მოკლე აღწერა არ არის მოცემული."
-    return textwrap.shorten(text, width=width, placeholder="...")
 
 
 def build_message(article: Article) -> str:
@@ -243,7 +266,7 @@ def build_message(article: Article) -> str:
         f"<b>სათაური:</b> {html.escape(article.title)}\n"
         f"<b>ქივორდი:</b> {html.escape(kws)}\n"
         f"<b>წყარო:</b> {html.escape(article.source)}\n"
-        f"<b>დრო:</b> {html.escape(entry_datetime_text(article.published))}\n\n"
+        f"<b>დრო:</b> {html.escape(article.published_text)}\n\n"
         f"<b>მოკლე აღწერა:</b> {html.escape(shorten(article.summary))}\n\n"
         f'🔗 <a href="{html.escape(article.link)}">სტატიის ბმული</a>'
     )
@@ -283,10 +306,7 @@ def main() -> int:
             sent += 1
             time.sleep(1)
         except Exception as exc:
-            print(
-                f"Failed to send article: {article.title}\nError: {exc}",
-                file=sys.stderr,
-            )
+            print(f"Failed to send article: {article.title}\nError: {exc}", file=sys.stderr)
 
     print(f"Sent {sent} article(s).")
     return 0
