@@ -21,7 +21,8 @@ load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "seen.db")
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/3.0)"
+TELEGRAM_PHOTO_API = "https://api.telegram.org/bot{token}/sendPhoto"
+USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/4.0)"
 
 # პირდაპირი feed-ები, რომლებიც ხშირად მუშაობს
 DIRECT_FEEDS = [
@@ -41,11 +42,13 @@ class Article:
     title: str
     link: str
     source: str
+    site_url: str
     published: str
     summary: str
     matched_keywords: List[str]
     uid: str
     published_dt: datetime | None
+    image_url: str | None
 
 
 def env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -152,6 +155,14 @@ def normalize_link(link: str) -> str:
     return link.strip()
 
 
+def site_from_link(link: str) -> str:
+    try:
+        parsed = urlparse(link)
+        return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        return link
+
+
 def make_uid(title: str, link: str) -> str:
     return hashlib.sha256(f"{title}|{link}".encode("utf-8")).hexdigest()
 
@@ -174,7 +185,6 @@ def tokenize_text(text: str) -> List[str]:
 
 
 def single_word_fuzzy_match(keyword_lower: str, words: List[str]) -> bool:
-    # ზუსტი ან ქართული ბრუნვებით გაფართოებული დამთხვევა
     for word in words:
         if word == keyword_lower:
             return True
@@ -184,11 +194,9 @@ def single_word_fuzzy_match(keyword_lower: str, words: List[str]) -> bool:
 
 
 def phrase_fuzzy_match(keyword_lower: str, text_lower: str) -> bool:
-    # ზუსტი ფრაზა
     if keyword_lower in text_lower:
         return True
 
-    # მრავლისიტყვიანი ფრაზისთვის თითოეული სიტყვის არსებობა/ფორმა
     parts = [p for p in keyword_lower.split() if p]
     if not parts:
         return False
@@ -222,7 +230,6 @@ def matched_keywords(text: str) -> List[str]:
             if single_word_fuzzy_match(kw_lower, words):
                 matches.append(kw)
 
-    # დუბლიკატების მოცილება, თან რიგის შენარჩუნება
     return list(dict.fromkeys(matches))
 
 
@@ -260,6 +267,32 @@ def cleaned_title(entry, feed_url: str) -> str:
         if len(parts) == 2 and parts[0].strip():
             return parts[0].strip()
     return title
+
+
+def extract_image_url(entry) -> str | None:
+    media_content = getattr(entry, "media_content", None)
+    if media_content and isinstance(media_content, list):
+        for item in media_content:
+            url = item.get("url")
+            if url:
+                return url
+
+    media_thumbnail = getattr(entry, "media_thumbnail", None)
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            url = item.get("url")
+            if url:
+                return url
+
+    for field in ("summary", "description"):
+        raw = getattr(entry, field, None)
+        if raw:
+            soup = BeautifulSoup(raw, "html.parser")
+            img = soup.find("img")
+            if img and img.get("src"):
+                return img["src"]
+
+    return None
 
 
 def parse_feed(url: str):
@@ -312,11 +345,13 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
                 title=title or "უსათაურო მასალა",
                 link=link,
                 source=source_from_entry(entry, feed_url, feed),
+                site_url=site_from_link(link),
                 published=entry_datetime_text(entry),
                 summary=summary,
                 matched_keywords=matches,
                 uid=uid,
                 published_dt=published_dt,
+                image_url=extract_image_url(entry),
             )
             items[uid] = article
 
@@ -335,31 +370,48 @@ def shorten(text: str, width: int = 320) -> str:
     return textwrap.shorten(text, width=width, placeholder="...")
 
 
-def build_message(article: Article) -> str:
+def build_caption(article: Article) -> str:
     kws = ", ".join(article.matched_keywords)
     return (
         f"📰 <b>ახალი მასალა</b>\n\n"
         f"<b>სათაური:</b> {html.escape(article.title)}\n"
         f"<b>ქივორდები:</b> {html.escape(kws)}\n"
         f"<b>წყარო:</b> {html.escape(article.source)}\n"
+        f"<b>საიტი:</b> {html.escape(article.site_url)}\n"
         f"<b>დრო:</b> {html.escape(article.published)}\n\n"
-        f"<b>მოკლე აღწერა:</b> {html.escape(shorten(article.summary))}\n\n"
+        f"<b>მოკლე აღწერა:</b> {html.escape(shorten(article.summary, 220))}\n\n"
         f'🔗 <a href="{html.escape(article.link)}">სტატიის ბმული</a>'
     )
 
 
-def send_telegram_message(text: str) -> None:
-    response = requests.post(
-        TELEGRAM_API.format(token=BOT_TOKEN),
-        data={
-            "chat_id": CHANNEL_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=30,
-        headers={"User-Agent": USER_AGENT},
-    )
+def send_telegram_message(article: Article) -> None:
+    caption = build_caption(article)
+
+    if article.image_url:
+        response = requests.post(
+            TELEGRAM_PHOTO_API.format(token=BOT_TOKEN),
+            data={
+                "chat_id": CHANNEL_ID,
+                "photo": article.image_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+            },
+            timeout=30,
+            headers={"User-Agent": USER_AGENT},
+        )
+    else:
+        response = requests.post(
+            TELEGRAM_API.format(token=BOT_TOKEN),
+            data={
+                "chat_id": CHANNEL_ID,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=30,
+            headers={"User-Agent": USER_AGENT},
+        )
+
     response.raise_for_status()
     payload = response.json()
     if not payload.get("ok"):
@@ -377,7 +429,7 @@ def main() -> int:
     sent = 0
     for article in articles:
         try:
-            send_telegram_message(build_message(article))
+            send_telegram_message(article)
             remember(conn, article)
             sent += 1
             time.sleep(1)
