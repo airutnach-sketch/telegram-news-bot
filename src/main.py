@@ -20,18 +20,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "seen.db")
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_TEXT_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_API = "https://api.telegram.org/bot{token}/sendPhoto"
-USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/4.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/5.0)"
 
-# პირდაპირი feed-ები, რომლებიც ხშირად მუშაობს
 DIRECT_FEEDS = [
     "https://civil.ge/feed/",
     "https://netgazeti.ge/feed/",
     "https://publika.ge/feed/",
 ]
 
-# Google News RSS-ის პარამეტრები
 GOOGLE_NEWS_HL = "ka"
 GOOGLE_NEWS_GL = "GE"
 GOOGLE_NEWS_CEID = "GE:ka"
@@ -67,7 +65,10 @@ BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 CHANNEL_ID = env("TELEGRAM_CHANNEL_ID", required=True)
 KEYWORDS = parse_keywords(env("KEYWORDS", required=True))
 BACKFILL_HOURS = int(env("BACKFILL_HOURS", "24"))
-MAX_POSTS_PER_RUN = int(env("MAX_POSTS_PER_RUN", "25"))
+MAX_POSTS_PER_RUN = int(env("MAX_POSTS_PER_RUN", "50"))
+
+# თუ True იქნება, თარიღის გარეშე მასალებსაც გაუშვებს
+ALLOW_UNDATED = env("ALLOW_UNDATED", "true").lower() == "true"
 
 
 def google_news_feed_url(keyword: str) -> str:
@@ -139,7 +140,7 @@ def parse_entry_datetime(entry) -> datetime | None:
 def is_within_last_hours(entry, hours: int) -> bool:
     entry_dt = parse_entry_datetime(entry)
     if entry_dt is None:
-        return False
+        return ALLOW_UNDATED
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     return entry_dt >= cutoff
 
@@ -184,12 +185,47 @@ def tokenize_text(text: str) -> List[str]:
     return re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
 
 
+def normalize_for_match(text: str) -> str:
+    return re.sub(r"\s+", " ", text.casefold()).strip()
+
+
+def stem_like_forms(keyword_lower: str) -> List[str]:
+    forms = {keyword_lower}
+
+    # მარტივი ქართული ბრუნვების/ფორმების მხარდაჭერა
+    if keyword_lower.endswith("ა"):
+        base = keyword_lower[:-1]
+        forms.update(
+            {
+                keyword_lower,
+                base + "ას",
+                base + "ამ",
+                base + "ასთან",
+                base + "აზე",
+                base + "ად",
+                base + "ათა",
+                base + "ებში",
+                base + "ის",
+                base + "თან",
+                base + "ზე",
+                base + "ს",
+                base + "მ",
+            }
+        )
+
+    return list(forms)
+
+
 def single_word_fuzzy_match(keyword_lower: str, words: List[str]) -> bool:
+    forms = stem_like_forms(keyword_lower)
     for word in words:
-        if word == keyword_lower:
-            return True
-        if word.startswith(keyword_lower):
-            return True
+        for form in forms:
+            if word == form:
+                return True
+            if word.startswith(form):
+                return True
+            if form.startswith(word) and len(word) >= max(3, len(form) - 2):
+                return True
     return False
 
 
@@ -203,23 +239,18 @@ def phrase_fuzzy_match(keyword_lower: str, text_lower: str) -> bool:
 
     words = tokenize_text(text_lower)
     for part in parts:
-        matched_part = False
-        for word in words:
-            if word == part or word.startswith(part):
-                matched_part = True
-                break
-        if not matched_part:
+        if not single_word_fuzzy_match(part, words):
             return False
     return True
 
 
 def matched_keywords(text: str) -> List[str]:
-    text_lower = text.casefold()
+    text_lower = normalize_for_match(text)
     words = tokenize_text(text)
     matches: List[str] = []
 
     for kw in KEYWORDS:
-        kw_lower = kw.casefold().strip()
+        kw_lower = normalize_for_match(kw)
         if not kw_lower:
             continue
 
@@ -325,14 +356,16 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
                 or getattr(entry, "description", "")
                 or ""
             )
+            source = source_from_entry(entry, feed_url, feed)
+            link = normalize_link(getattr(entry, "link", "") or "")
 
-            text_blob = f"{title} {summary}"
-            matches = matched_keywords(text_blob)
-            if not matches:
+            if not link:
                 continue
 
-            link = normalize_link(getattr(entry, "link", "") or "")
-            if not link:
+            # აგრესიული ძებნა: სათაური + summary + link + source
+            text_blob = f"{title}\n{summary}\n{link}\n{source}"
+            matches = matched_keywords(text_blob)
+            if not matches:
                 continue
 
             uid = make_uid(title, link)
@@ -344,7 +377,7 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
             article = Article(
                 title=title or "უსათაურო მასალა",
                 link=link,
-                source=source_from_entry(entry, feed_url, feed),
+                source=source,
                 site_url=site_from_link(link),
                 published=entry_datetime_text(entry),
                 summary=summary,
@@ -357,7 +390,7 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
 
     articles = list(items.values())
     articles.sort(
-        key=lambda a: a.published_dt or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda a: a.published_dt or datetime.now(timezone.utc),
         reverse=True,
     )
     return articles[:MAX_POSTS_PER_RUN]
@@ -401,7 +434,7 @@ def send_telegram_message(article: Article) -> None:
         )
     else:
         response = requests.post(
-            TELEGRAM_API.format(token=BOT_TOKEN),
+            TELEGRAM_TEXT_API.format(token=BOT_TOKEN),
             data={
                 "chat_id": CHANNEL_ID,
                 "text": caption,
