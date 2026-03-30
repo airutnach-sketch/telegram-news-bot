@@ -22,7 +22,7 @@ load_dotenv()
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "seen.db")
 TELEGRAM_TEXT_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_API = "https://api.telegram.org/bot{token}/sendPhoto"
-USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/5.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; TelegramNewsMonitor/6.0)"
 
 DIRECT_FEEDS = [
     "https://civil.ge/feed/",
@@ -34,6 +34,9 @@ GOOGLE_NEWS_HL = "ka"
 GOOGLE_NEWS_GL = "GE"
 GOOGLE_NEWS_CEID = "GE:ka"
 
+HTTP_TIMEOUT = 30
+FULL_TEXT_MAX_CHARS = 12000
+
 
 @dataclass
 class Article:
@@ -43,6 +46,7 @@ class Article:
     site_url: str
     published: str
     summary: str
+    body_text: str
     matched_keywords: List[str]
     uid: str
     published_dt: datetime | None
@@ -66,8 +70,6 @@ CHANNEL_ID = env("TELEGRAM_CHANNEL_ID", required=True)
 KEYWORDS = parse_keywords(env("KEYWORDS", required=True))
 BACKFILL_HOURS = int(env("BACKFILL_HOURS", "24"))
 MAX_POSTS_PER_RUN = int(env("MAX_POSTS_PER_RUN", "50"))
-
-# თუ True იქნება, თარიღის გარეშე მასალებსაც გაუშვებს
 ALLOW_UNDATED = env("ALLOW_UNDATED", "true").lower() == "true"
 
 
@@ -192,7 +194,6 @@ def normalize_for_match(text: str) -> str:
 def stem_like_forms(keyword_lower: str) -> List[str]:
     forms = {keyword_lower}
 
-    # მარტივი ქართული ბრუნვების/ფორმების მხარდაჭერა
     if keyword_lower.endswith("ა"):
         base = keyword_lower[:-1]
         forms.update(
@@ -300,6 +301,26 @@ def cleaned_title(entry, feed_url: str) -> str:
     return title
 
 
+def extract_image_url_from_html(soup: BeautifulSoup) -> str | None:
+    meta_candidates = [
+        ("meta", {"property": "og:image"}, "content"),
+        ("meta", {"name": "og:image"}, "content"),
+        ("meta", {"property": "twitter:image"}, "content"),
+        ("meta", {"name": "twitter:image"}, "content"),
+    ]
+
+    for tag_name, attrs, value_attr in meta_candidates:
+        tag = soup.find(tag_name, attrs=attrs)
+        if tag and tag.get(value_attr):
+            return tag.get(value_attr)
+
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img.get("src")
+
+    return None
+
+
 def extract_image_url(entry) -> str | None:
     media_content = getattr(entry, "media_content", None)
     if media_content and isinstance(media_content, list):
@@ -324,6 +345,37 @@ def extract_image_url(entry) -> str | None:
                 return img["src"]
 
     return None
+
+
+def fetch_article_page(link: str) -> tuple[str, str | None]:
+    try:
+        response = requests.get(
+            link,
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for bad in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
+            bad.decompose()
+
+        body = soup.find("article")
+        if body is None:
+            body = soup.find("main")
+        if body is None:
+            body = soup.body or soup
+
+        text = body.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()
+        text = text[:FULL_TEXT_MAX_CHARS]
+
+        image_url = extract_image_url_from_html(soup)
+        return text, image_url
+    except Exception as exc:
+        print(f"Article fetch failed for {link}: {exc}", file=sys.stderr)
+        return "", None
 
 
 def parse_feed(url: str):
@@ -362,14 +414,16 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
             if not link:
                 continue
 
-            # აგრესიული ძებნა: სათაური + summary + link + source
-            text_blob = f"{title}\n{summary}\n{link}\n{source}"
-            matches = matched_keywords(text_blob)
-            if not matches:
-                continue
-
             uid = make_uid(title, link)
             if already_seen(conn, uid):
+                continue
+
+            body_text, page_image = fetch_article_page(link)
+
+            # აგრესიული ძებნა: title + summary + source + link + full article text
+            text_blob = f"{title}\n{summary}\n{source}\n{link}\n{body_text}"
+            matches = matched_keywords(text_blob)
+            if not matches:
                 continue
 
             published_dt = parse_entry_datetime(entry)
@@ -380,11 +434,12 @@ def collect_articles(conn: sqlite3.Connection) -> List[Article]:
                 source=source,
                 site_url=site_from_link(link),
                 published=entry_datetime_text(entry),
-                summary=summary,
+                summary=summary or body_text[:500],
+                body_text=body_text,
                 matched_keywords=matches,
                 uid=uid,
                 published_dt=published_dt,
-                image_url=extract_image_url(entry),
+                image_url=extract_image_url(entry) or page_image,
             )
             items[uid] = article
 
@@ -405,6 +460,7 @@ def shorten(text: str, width: int = 320) -> str:
 
 def build_caption(article: Article) -> str:
     kws = ", ".join(article.matched_keywords)
+    preview_text = article.summary or article.body_text
     return (
         f"📰 <b>ახალი მასალა</b>\n\n"
         f"<b>სათაური:</b> {html.escape(article.title)}\n"
@@ -412,7 +468,7 @@ def build_caption(article: Article) -> str:
         f"<b>წყარო:</b> {html.escape(article.source)}\n"
         f"<b>საიტი:</b> {html.escape(article.site_url)}\n"
         f"<b>დრო:</b> {html.escape(article.published)}\n\n"
-        f"<b>მოკლე აღწერა:</b> {html.escape(shorten(article.summary, 220))}\n\n"
+        f"<b>მოკლე აღწერა:</b> {html.escape(shorten(preview_text, 220))}\n\n"
         f'🔗 <a href="{html.escape(article.link)}">სტატიის ბმული</a>'
     )
 
@@ -429,7 +485,7 @@ def send_telegram_message(article: Article) -> None:
                 "caption": caption,
                 "parse_mode": "HTML",
             },
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
         )
     else:
@@ -441,7 +497,7 @@ def send_telegram_message(article: Article) -> None:
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False,
             },
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
         )
 
